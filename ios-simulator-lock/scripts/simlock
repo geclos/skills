@@ -1,0 +1,475 @@
+#!/bin/bash
+#
+# simlock - coordinate a single shared iOS Simulator device across every agent
+#           on this host. At most one booted device, owned by one agent, and no
+#           agent ever disturbs another agent's device or process.
+#
+# No dependencies beyond macOS: /bin/bash 3.2, coreutils, `xcrun simctl`, and
+# python3 (only for JSON). Read `SKILL.md` for the protocol.
+#
+# Exit codes:
+#   0  success / lock free
+#   2  usage error
+#   3  held by a LIVE owner (acquire fail-fast; status: held)
+#   4  a STALE lock is present (run `simlock steal --force`)
+#   5  refusing to act on a lock this caller does not own
+#   6  steal refused: the owner is still live
+#   7  --wait timed out while a live owner held the lock
+
+set -u
+
+# --- configuration ----------------------------------------------------------
+
+STATE_DIR="${SIMLOCK_STATE_DIR:-$HOME/.agents/state/ios-simulator}"
+LOCK_DIR="$STATE_DIR/lock"
+STEAL_LOG="$STATE_DIR/steal.log"
+
+# The simctl command. Overridable so tests can inject a fake without a
+# simulator. Default is the real `xcrun simctl`. Deliberately word-split.
+SIMCTL="${SIMLOCK_SIMCTL:-xcrun simctl}"
+
+DEFAULT_TTL=1800
+
+# --- small helpers ----------------------------------------------------------
+
+prog="simlock"
+err()  { printf '%s\n' "$*" >&2; }
+die()  { err "$prog: $*"; exit 2; }
+epoch() { date +%s; }
+
+simctl() { $SIMCTL "$@"; }
+
+is_pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+
+meta_get() { [ -f "$LOCK_DIR/$1" ] && cat "$LOCK_DIR/$1" 2>/dev/null || true; }
+meta_set() { printf '%s' "$2" > "$LOCK_DIR/$1"; }
+
+ensure_state_dir() { mkdir -p "$STATE_DIR" 2>/dev/null || true; }
+
+# Does this caller own the current lock?
+#   - by process identity: the recorded pid is this simlock process ($$, the
+#     `with` case) or its parent ($PPID);
+#   - or by a stable label token ($SIMLOCK_LABEL) that the agent keeps constant
+#     across separate `acquire`/`heartbeat`/`release` invocations. This is the
+#     reliable path for bare CLI use, because capturing acquire's stdout with
+#     $(...) makes $PPID a transient subshell that has already exited.
+we_own() {
+  local opid olabel mylabel
+  opid="$(meta_get pid)"
+  [ -n "$opid" ] && { [ "$opid" = "$$" ] || [ "$opid" = "$PPID" ]; } && return 0
+  mylabel="${SIMLOCK_LABEL:-}"
+  olabel="$(meta_get label)"
+  [ -n "$mylabel" ] && [ "$mylabel" = "$olabel" ]
+}
+
+# Is the current holder LIVE? Two ownership models:
+#   supervised=1 (`with`): a long-lived simlock process supervises the run, so
+#     its pid is authoritative -- live iff that pid is alive, regardless of TTL.
+#     A crashed `with` (pid gone) is stale at once, even inside its TTL window.
+#   supervised=0 (bare `acquire`): the recorded pid may be a transient subshell,
+#     so it is only informational; liveness is governed by the heartbeat/TTL
+#     window. This is exactly what TTL means: valid this long without a heartbeat.
+holder_alive() {
+  local pid ttl hb age supervised
+  pid="$(meta_get pid)"
+  ttl="$(meta_get ttl)"
+  hb="$(meta_get heartbeat)"
+  supervised="$(meta_get supervised)"
+  [ -n "$pid" ] || return 1
+  if [ "$supervised" = 1 ]; then
+    is_pid_alive "$pid"
+    return $?
+  fi
+  # bare lock: heartbeat within TTL == live
+  if [ -n "$hb" ] && [ -n "$ttl" ]; then
+    age=$(( $(epoch) - hb ))
+    [ "$age" -le "$ttl" ] || return 1
+  fi
+  return 0
+}
+
+fmt_age() {
+  local s="${1:-0}"
+  if   [ "$s" -lt 60 ]; then printf '%ds' "$s"
+  elif [ "$s" -lt 3600 ]; then printf '%dm%ds' $(( s / 60 )) $(( s % 60 ))
+  else printf '%dh%dm' $(( s / 3600 )) $(( (s % 3600) / 60 )); fi
+}
+
+print_holder() {  # human summary of the current holder, to stderr
+  local pid label purpose cwd dev acq hb now age hbage state
+  pid="$(meta_get pid)"; label="$(meta_get label)"; purpose="$(meta_get purpose)"
+  cwd="$(meta_get cwd)"; dev="$(meta_get device)"; acq="$(meta_get acquired_at)"
+  hb="$(meta_get heartbeat)"; now="$(epoch)"
+  age=0; [ -n "$acq" ] && age=$(( now - acq ))
+  hbage=0; [ -n "$hb" ] && hbage=$(( now - hb ))
+  if holder_alive; then state="live"; else state="STALE"; fi
+  err "  lock held ($state)"
+  err "    owner pid : ${pid:-?}   label: ${label:-?}"
+  err "    purpose   : ${purpose:-?}"
+  err "    worktree  : ${cwd:-?}"
+  err "    device    : ${dev:-<none recorded>}"
+  err "    held for  : $(fmt_age "$age")   last heartbeat: $(fmt_age "$hbage") ago"
+}
+
+# Resolve a device name-or-udid to a udid via simctl. Prefer a Booted match,
+# else the first match. Falls back to the raw input when resolution is empty
+# (offline, unknown name, or already a udid).
+resolve_device() {
+  local want="$1" out
+  [ -z "$want" ] && { printf ''; return; }
+  out="$(simctl list devices -j 2>/dev/null | python3 -c '
+import sys, json
+want = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+best = None
+for _rt, devs in data.get("devices", {}).items():
+    for d in devs:
+        if d.get("udid") == want or d.get("name") == want:
+            if d.get("state") == "Booted":
+                print(d["udid"]); sys.exit(0)
+            if best is None:
+                best = d.get("udid")
+if best:
+    print(best)
+' "$want" 2>/dev/null)"
+  [ -n "$out" ] && printf '%s' "$out" || printf '%s' "$want"
+}
+
+# --- acquire ----------------------------------------------------------------
+# Global ACQ_OWNER lets `with` record itself ($$, long-lived) while a bare
+# `acquire` records its parent ($PPID). ACQ_SUPERVISED marks the `with` case so
+# holder_alive() treats the pid as authoritative.
+ACQ_OWNER=""
+ACQ_SUPERVISED=0
+
+do_acquire() {
+  local device="" purpose="" label="" wait=0 ttl="$DEFAULT_TTL" quiet=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --device)  device="${2:-}"; shift 2 ;;
+      --purpose) purpose="${2:-}"; shift 2 ;;
+      --label)   label="${2:-}"; shift 2 ;;
+      --wait)    wait="${2:-0}"; shift 2 ;;
+      --ttl)     ttl="${2:-$DEFAULT_TTL}"; shift 2 ;;
+      --quiet)   quiet=1; shift ;;
+      *) die "acquire: unknown option '$1'" ;;
+    esac
+  done
+  [ -n "$label" ] || label="${SIMLOCK_LABEL:-pid:$ACQ_OWNER}"
+
+  ensure_state_dir
+  local end forming=0
+  end=$(( $(epoch) + wait ))
+
+  while : ; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      # Write the owner pid FIRST so the lock is never visible-but-unowned:
+      # resolve_device below spawns python3, and a signal in that window must
+      # still find an owned lock to clean up.
+      meta_set pid "$ACQ_OWNER"
+      LOCK_CREATED_BY_ME=1
+      local udid; udid="$(resolve_device "$device")"
+      meta_set label "$label"
+      meta_set purpose "$purpose"
+      meta_set cwd "$(pwd)"
+      meta_set device "$udid"
+      meta_set ttl "$ttl"
+      meta_set supervised "$ACQ_SUPERVISED"
+      meta_set acquired_at "$(epoch)"
+      meta_set heartbeat "$(epoch)"
+      [ "$quiet" = 1 ] || {
+        err "$prog: acquired (owner pid $ACQ_OWNER, ttl ${ttl}s)"
+        [ -n "$udid" ] && err "$prog: use device $udid"
+      }
+      printf '%s\n' "$udid"      # machine-readable: the device udid on stdout
+      return 0
+    fi
+
+    # mkdir failed: someone holds it (or is mid-forming).
+    if [ -z "$(meta_get pid)" ]; then
+      forming=$(( forming + 1 ))
+      [ "$forming" -ge 10 ] && { err "$prog: lock dir present but unpopulated; try steal --force"; return 4; }
+      sleep 1; continue
+    fi
+
+    if holder_alive; then
+      if [ "$(epoch)" -ge "$end" ]; then
+        err "$prog: simulator lock is held by a live agent."
+        print_holder
+        [ "$wait" -gt 0 ] && return 7 || return 3
+      fi
+      sleep 1; continue
+    else
+      err "$prog: a STALE lock is present (owner gone or heartbeat expired)."
+      print_holder
+      err "$prog: run 'simlock steal --force' to break it, then retry."
+      return 4
+    fi
+  done
+}
+
+# --- release ----------------------------------------------------------------
+RELEASED=0
+do_release() {
+  local force="${1:-0}"
+  if [ ! -d "$LOCK_DIR" ]; then
+    err "$prog: no lock held (nothing to release)"
+    return 0
+  fi
+  if ! we_own && [ "$force" != 1 ]; then
+    err "$prog: refusing to release a lock owned by pid $(meta_get pid) (use --force)"
+    return 5
+  fi
+  local dev; dev="$(meta_get device)"
+  if [ -n "$dev" ]; then
+    # Shut down ONLY the recorded device. Never 'shutdown all', never killall.
+    simctl shutdown "$dev" >/dev/null 2>&1 || true
+    err "$prog: shut down device $dev"
+  fi
+  rm -rf "$LOCK_DIR"
+  err "$prog: released"
+  return 0
+}
+
+# release the lock this process owns; used by `with` trap. Idempotent.
+# Cleans up if we own it OR if this very process created it (covers a signal
+# that lands mid-acquire, before ownership metadata is fully written).
+LOCK_CREATED_BY_ME=0
+release_self() {
+  [ "$RELEASED" = 1 ] && return 0
+  RELEASED=1
+  if [ -d "$LOCK_DIR" ] && { we_own || [ "$LOCK_CREATED_BY_ME" = 1 ]; }; then
+    local dev; dev="$(meta_get device)"
+    [ -n "$dev" ] && simctl shutdown "$dev" >/dev/null 2>&1 || true
+    rm -rf "$LOCK_DIR"
+  fi
+}
+
+# --- heartbeat --------------------------------------------------------------
+do_heartbeat() {
+  [ -d "$LOCK_DIR" ] || { err "$prog: no lock held"; return 5; }
+  if ! we_own; then
+    err "$prog: refusing to heartbeat a lock owned by pid $(meta_get pid)"
+    return 5
+  fi
+  meta_set heartbeat "$(epoch)"
+  err "$prog: heartbeat at $(epoch)"
+  return 0
+}
+
+# --- status -----------------------------------------------------------------
+do_status() {
+  local json=0
+  [ "${1:-}" = "--json" ] && json=1
+
+  if [ ! -d "$LOCK_DIR" ]; then
+    if [ "$json" = 1 ]; then printf '{"held": false}\n'; else err "$prog: free"; fi
+    return 0
+  fi
+
+  local alive="false"; holder_alive && alive="true"
+  if [ "$json" = 1 ]; then
+    STATE_DIR="$STATE_DIR" ALIVE="$alive" python3 - "$LOCK_DIR" <<'PY'
+import json, os, sys, time
+d = sys.argv[1]
+def g(k):
+    p = os.path.join(d, k)
+    try:
+        return open(p).read()
+    except Exception:
+        return ""
+now = int(time.time())
+def i(k):
+    v = g(k)
+    return int(v) if v.strip().isdigit() else None
+acq = i("acquired_at"); hb = i("heartbeat")
+out = {
+    "held": True,
+    "alive": os.environ.get("ALIVE") == "true",
+    "pid": g("pid"), "label": g("label"), "purpose": g("purpose"),
+    "cwd": g("cwd"), "device": g("device"),
+    "supervised": g("supervised") == "1",
+    "ttl": i("ttl"), "acquired_at": acq, "heartbeat": hb,
+    "age_seconds": (now - acq) if acq else None,
+    "heartbeat_age_seconds": (now - hb) if hb else None,
+}
+print(json.dumps(out))
+PY
+  else
+    print_holder
+  fi
+  return 3   # held -> non-zero
+}
+
+# --- doctor -----------------------------------------------------------------
+do_doctor() {
+  err "== simlock doctor =="
+  err ""
+  # 1. The lock, if any.
+  if [ -d "$LOCK_DIR" ]; then
+    print_holder
+  else
+    err "  lock: free"
+  fi
+  err ""
+
+  # 2. Booted devices (read-only) vs the lock.
+  local locked_dev booted
+  locked_dev="$(meta_get device)"
+  err "  booted simulator devices:"
+  booted="$(simctl list devices booted -j 2>/dev/null | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for _rt, devs in data.get("devices", {}).items():
+    for d in devs:
+        if d.get("state") == "Booted":
+            print("%s\t%s" % (d.get("udid",""), d.get("name","")))
+' 2>/dev/null)"
+  if [ -z "$booted" ]; then
+    err "    (none)"
+  else
+    printf '%s\n' "$booted" | while IFS="$(printf '\t')" read -r udid name; do
+      if [ -n "$locked_dev" ] && [ "$udid" = "$locked_dev" ]; then
+        err "    $udid  $name  [covered by lock]"
+      else
+        err "    $udid  $name  [UNCOORDINATED - not owned by the lock]"
+      fi
+    done
+  fi
+  err ""
+
+  # 3. Running xcodebuild / xctest and who owns them (read-only).
+  err "  build/test processes:"
+  local procs; procs="$(pgrep -fl 'xcodebuild|xctest' 2>/dev/null | grep -v 'simlock' || true)"
+  if [ -z "$procs" ]; then
+    err "    (none)"
+  else
+    printf '%s\n' "$procs" | while read -r pid rest; do
+      local pcwd; pcwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+      err "    pid $pid  cwd=${pcwd:-?}"
+      err "      $rest"
+    done
+  fi
+  err ""
+
+  # 4. Stale lock verdict.
+  if [ -d "$LOCK_DIR" ]; then
+    if holder_alive; then
+      err "  verdict: lock owner looks LIVE. Do not steal."
+    else
+      err "  verdict: lock is STALE. 'simlock steal --force' is allowed."
+    fi
+  fi
+  return 0
+}
+
+# --- steal ------------------------------------------------------------------
+do_steal() {
+  local force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *) die "steal: unknown option '$1'" ;;
+    esac
+  done
+  [ "$force" = 1 ] || die "steal requires --force"
+
+  if [ ! -d "$LOCK_DIR" ]; then
+    err "$prog: nothing to steal (lock is free)"
+    return 0
+  fi
+  if holder_alive; then
+    err "$prog: refusing to steal - the owner is still LIVE."
+    print_holder
+    return 6
+  fi
+
+  ensure_state_dir
+  local pid label purpose dev
+  pid="$(meta_get pid)"; label="$(meta_get label)"
+  purpose="$(meta_get purpose)"; dev="$(meta_get device)"
+  printf '%s\tstolen_by pid=%s label=%s\tfrom pid=%s label=%s purpose=%s device=%s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$PPID" "${SIMLOCK_LABEL:-pid:$PPID}" \
+    "$pid" "$label" "$purpose" "$dev" >> "$STEAL_LOG"
+
+  rm -rf "$LOCK_DIR"
+  err "$prog: broke stale lock (was pid $pid, $label)."
+  err "$prog: logged to $STEAL_LOG"
+  if [ -n "$dev" ]; then
+    err "$prog: NOTE - previous device $dev was not shut down (it may be an orphan booted by the dead owner)."
+    err "$prog: run 'simlock doctor' to inspect it; do not blind-shutdown a device you did not boot."
+  fi
+  return 0
+}
+
+# --- with -- <command...> ---------------------------------------------------
+do_with() {
+  local acq_args=()
+  # Collect acquire options up to the '--' separator.
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift; break ;;
+      *) acq_args+=("$1"); shift ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "with: no command after '--'"
+
+  ACQ_OWNER=$$          # this simlock process owns the lock for the run.
+  ACQ_SUPERVISED=1      # pid is authoritative for a supervised run.
+
+  # Install the cleanup traps BEFORE acquiring, so a signal during acquisition
+  # cannot wedge a half-created lock. child is empty until the command starts.
+  local child="" rc
+  trap 'release_self' EXIT
+  trap 'kill -TERM "${child:-}" 2>/dev/null; release_self; exit 143' TERM INT
+
+  # Guard the array expansion: bash 3.2 + `set -u` errors on an empty "${a[@]}".
+  do_acquire --quiet ${acq_args[@]+"${acq_args[@]}"} >/dev/null || return $?
+
+  export SIMLOCK_DEVICE; SIMLOCK_DEVICE="$(meta_get device)"
+  err "$prog: running under lock; SIMLOCK_DEVICE=${SIMLOCK_DEVICE:-<none>}"
+
+  "$@" &
+  child=$!
+  wait "$child"; rc=$?
+  release_self
+  return "$rc"
+}
+
+# --- dispatch ---------------------------------------------------------------
+usage() {
+  cat >&2 <<USAGE
+$prog - one shared iOS Simulator, one owner, no cross-agent interference.
+
+usage:
+  $prog acquire [--device <name|udid>] [--purpose "<text>"] [--label <t>]
+                [--wait <seconds>] [--ttl <seconds>]
+  $prog release [--force]
+  $prog heartbeat
+  $prog status [--json]
+  $prog doctor
+  $prog steal --force
+  $prog with [acquire-opts] -- <command> [args...]
+
+state dir: $STATE_DIR   (override with \$SIMLOCK_STATE_DIR)
+USAGE
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift || true
+case "$cmd" in
+  acquire)   ACQ_OWNER=$PPID; ACQ_SUPERVISED=0; do_acquire "$@"; exit $? ;;
+  release)   f=0; [ "${1:-}" = "--force" ] && f=1; do_release "$f"; exit $? ;;
+  heartbeat) do_heartbeat; exit $? ;;
+  status)    do_status "${1:-}"; exit $? ;;
+  doctor)    do_doctor; exit $? ;;
+  steal)     do_steal "$@"; exit $? ;;
+  with)      do_with "$@"; exit $? ;;
+  ""|-h|--help|help) usage; [ -z "$cmd" ] && exit 2 || exit 0 ;;
+  *) die "unknown command '$cmd' (try --help)" ;;
+esac
