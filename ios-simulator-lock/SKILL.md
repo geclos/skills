@@ -1,6 +1,6 @@
 ---
 name: ios-simulator-lock
-description: Coordinate the shared iOS Simulator on this Mac so at most one device is booted, owned by exactly one agent. Use BEFORE booting a simulator, running `xcodebuild` / `xcodebuild test`, launching an app on a simulator, or doing any iOS QA on this host — several agents share one machine and booting several simulators at once, or shutting down a device another agent is testing against, breaks their runs. Provides the `simlock` CLI (acquire / release / heartbeat / status / doctor / steal / with).
+description: Coordinate the iOS Simulator as a finite shared resource so at most one device is booted, owned by exactly one agent. Use BEFORE booting a simulator, running `xcodebuild` / `xcodebuild test`, launching an app on a simulator, or doing any iOS QA on a machine that may be running other agents — several agents booting devices at once, or one shutting down a device another is testing against, breaks their runs. Provides the `simlock` CLI (acquire / release / heartbeat / status / doctor / steal / with).
 compatibility: macOS with Xcode (`xcrun simctl`) and python3. State lives in `~/.agents/state/ios-simulator`, shared by every agent on the host.
 ---
 
@@ -8,9 +8,10 @@ compatibility: macOS with Xcode (`xcrun simctl`) and python3. State lives in `~/
 
 ## The one-simulator rule
 
-This Mac runs many agents at once — Claude Code sessions in different git
-worktrees, plus other agent tools. The iOS Simulator is a shared, heavy
-resource. Two failures keep happening:
+One machine often runs several agents at once — coding-agent sessions in
+different checkouts, plus other agent tools. The iOS Simulator is a finite,
+heavy resource: one device at a time is what the machine can actually carry.
+Two failures follow from sharing it without a protocol:
 
 - Booting several simulator devices at once exhausts the machine.
 - One agent frees CPU with `xcrun simctl shutdown all` or `killall Simulator`
@@ -18,7 +19,7 @@ resource. Two failures keep happening:
   agent's `xcodebuild` then keeps running against a device shut out from under
   it.
 
-So the rule on this host is: **at most one simulator device is booted at a
+So the rule is: **at most one simulator device is booted at a
 time, it is owned by exactly one agent, and no agent ever disturbs another
 agent's device or process.** `simlock` enforces this. Run it through
 `scripts/simlock` (put it on your `PATH` or call it by full path).
@@ -48,7 +49,7 @@ export a stable owner token first so a later `release`/`heartbeat` from a
 different shell is recognised as yours:
 
 ```sh
-export SIMLOCK_LABEL="worktree-onboarding"
+export SIMLOCK_LABEL="onboarding-qa"
 ```
 
 ## When the lock is held
@@ -123,57 +124,24 @@ stale. It never kills anything. Read its output before you touch anything.
 | `steal --force` | break a provably-dead lock | 6 owner live |
 | `with … -- cmd` | acquire, run, release on exit (preferred) | passes cmd's code |
 
----
+## iOS QA hygiene that affects the shared device
 
-# idem repo specifics (verify against the repo, not this file)
+Repo-agnostic, and all three are about not wasting the one device:
 
-The section above is host-wide and works for any iOS repo. The facts below are
-specific to `~/dev/idem` (`apps/ios`). Confirm them in
-`apps/ios/CLAUDE.md` and `apps/ios/QA.md` before relying on them — they can
-drift.
+- **Reuse one long-lived device; do not `simctl create` per session.** Only one
+  agent runs a device at a time, so a fresh device per session buys nothing and
+  costs disk and orphans. Pass the device you standardise on with
+  `--device "<name or UDID>"` and drive `$SIMLOCK_DEVICE`.
+- **Boot first, then test, one suite per invocation.** A whole-app test run can
+  flake at test-runner launch ("test runner exited with code 0 before
+  establishing connection", "Mach error -308 - server died"). Boot
+  `$SIMLOCK_DEVICE`, then pass a single `-only-testing:<Target>/<Suite>` per
+  `xcodebuild` invocation, rather than letting `xcodebuild` boot a device for
+  the entire suite.
+- **A hung run is not a slow run.** If the build log stops advancing for
+  several minutes — commonly right after package resolution — the run is
+  wedged, not working. Kill your own `xcodebuild`, run `simlock doctor`, then
+  retry. Never kill an `xcodebuild` that `doctor` attributes to another agent.
 
-- **Never pass `CODE_SIGNING_ALLOWED=NO` to an iOS build.** `QA.md` documents
-  the failure: it ad-hoc-signs with an empty entitlements dict, the Keychain
-  fails with `errSecMissingEntitlement (-34018)`, `Keychain.sessionToken()`
-  returns nil, and the WebSocket `connect` gives up silently — login "works",
-  then the message bubble goes red, the session is lost on every relaunch, and
-  the consent screen reappears. One flag, three misleading symptoms.
-
-- **Build shape** (Tuist project, no checked-in `.xcodeproj`; `tuist` is pinned
-  in `.mise.toml`, not on `PATH`):
-
-  ```sh
-  cd apps/ios
-  tuist install && tuist generate --no-open
-  xcodebuild -workspace idem.xcworkspace -scheme idem -configuration Debug \
-    -destination "id=$SIMLOCK_DEVICE" build
-  ```
-
-  Verify entitlements after building:
-  `codesign -d --entitlements :- "$APP" | plutil -p -` must list
-  `keychain-access-groups`.
-
-- **One shared, long-lived device — do not create a new simulator per session.**
-  This is the whole point of the lock: only one agent runs a device at a time,
-  so reuse one long-lived `iPhone 17 Pro` rather than
-  `simctl create`-ing a fresh device each session (disk cost, orphans). Note:
-  `QA.md`'s "dedicated simulator per session" advice predates this lock and
-  assumed uncoordinated parallel agents; under `simlock` the shared device is
-  the coordinated single device. Pass it with `--device "iPhone 17 Pro"` (or
-  its UDID) and boot `$SIMLOCK_DEVICE`.
-
-- **Tests / `xcodebuild test`:** `apps/ios` has a real unit-test target,
-  `idemTests` (declared in `apps/ios/Project.swift`, sources `Tests/**`), so
-  `-only-testing:idemTests/<Suite>` is valid. Note that `apps/ios/CLAUDE.md`
-  still describes iOS QA as manual TestFlight with no automated suite; that
-  text is stale — trust `Project.swift` and the `Tests/` directory.
-- **Run suite by suite, on a pre-booted device.** A whole-app
-  `-only-testing:idemTests` run flakes at test-runner launch ("test runner
-  exited with code 0 before establishing connection", or "Mach error -308 -
-  server died"); observed twice on this host. Boot `$SIMLOCK_DEVICE` first and
-  pass one `-only-testing:idemTests/<Suite>` per invocation rather than letting
-  `xcodebuild` boot a device for the whole app suite.
-- **A hung run is not a slow run.** If the log stops advancing after
-  "Resolved source packages" for several minutes, the run is wedged: kill your
-  own `xcodebuild`, then `simlock doctor` before retrying. Never kill an
-  `xcodebuild` that `doctor` attributes to another agent.
+Anything else is your repo's business, not this skill's: keep build flags,
+scheme names, signing requirements and QA runbooks in that repo's own docs.

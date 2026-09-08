@@ -106,7 +106,7 @@ print_holder() {  # human summary of the current holder, to stderr
   err "  lock held ($state)"
   err "    owner pid : ${pid:-?}   label: ${label:-?}"
   err "    purpose   : ${purpose:-?}"
-  err "    worktree  : ${cwd:-?}"
+  err "    directory : ${cwd:-?}"
   err "    device    : ${dev:-<none recorded>}"
   err "    held for  : $(fmt_age "$age")   last heartbeat: $(fmt_age "$hbage") ago"
 }
