@@ -162,11 +162,18 @@ drift.
   the coordinated single device. Pass it with `--device "iPhone 17 Pro"` (or
   its UDID) and boot `$SIMLOCK_DEVICE`.
 
-- **Tests / `xcodebuild test`:** as of this writing `apps/ios` has **no Swift
-  test target** — `CLAUDE.md` states iOS QA is manual TestFlight, there is no
-  automated suite yet. General `xcodebuild test` hygiene still applies when a
-  suite is added: a whole-app test run can flake at test-runner launch, so
-  prefer per-suite runs (`-only-testing:<Suite>`) and a pre-booted device
-  (boot `$SIMLOCK_DEVICE` before the test invocation) over letting `xcodebuild`
-  boot one. Do not copy `-only-testing:idemTests` from anywhere as if it were a
-  real target — confirm the scheme's test targets first.
+- **Tests / `xcodebuild test`:** `apps/ios` has a real unit-test target,
+  `idemTests` (declared in `apps/ios/Project.swift`, sources `Tests/**`), so
+  `-only-testing:idemTests/<Suite>` is valid. Note that `apps/ios/CLAUDE.md`
+  still describes iOS QA as manual TestFlight with no automated suite; that
+  text is stale — trust `Project.swift` and the `Tests/` directory.
+- **Run suite by suite, on a pre-booted device.** A whole-app
+  `-only-testing:idemTests` run flakes at test-runner launch ("test runner
+  exited with code 0 before establishing connection", or "Mach error -308 -
+  server died"); observed twice on this host. Boot `$SIMLOCK_DEVICE` first and
+  pass one `-only-testing:idemTests/<Suite>` per invocation rather than letting
+  `xcodebuild` boot a device for the whole app suite.
+- **A hung run is not a slow run.** If the log stops advancing after
+  "Resolved source packages" for several minutes, the run is wedged: kill your
+  own `xcodebuild`, then `simlock doctor` before retrying. Never kill an
+  `xcodebuild` that `doctor` attributes to another agent.
